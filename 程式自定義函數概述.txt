@@ -1,0 +1,22 @@
+LCD_ini();                   	//清空LCD
+lcd_print(第幾個,第幾排,字串)   //印字串
+lcd_int_print(整數)		//印整數
+
+/*
+LCD_setCursor(第幾個,第0or1排);		  	印數字 用ASC碼方式			
+LCD_Write('0'+整數0-9);		*/
+LCD的變數一次只能印一個
+
+int checkword(void)     仿scan  僅0-9 
+
+
+
+a     計數
+time  倒數為止
+ra    循環計數
+rtime 循環倒數為止
+
+cm(distance)餵食距離
+f     超音波開關
+
+eat_time 食物餵食砸門開啟多久

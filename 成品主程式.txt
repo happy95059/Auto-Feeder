@@ -1,0 +1,893 @@
+/* Includes ------------------------------------------------------------------------------------------------*/
+#include "ht32.h"
+#include "ht32_board.h"
+#include "ht32_board_config.h"
+#include "string.h"
+#define LCD_CLEARDISPLAY 0x01
+#define LCD_RETURNHOME 0x02
+#define LCD_ENTRYMODESET 0x04
+#define LCD_DISPLAYCONTROL 0x08
+#define LCD_CURSORSHIFT 0x10
+#define LCD_FUNCTIONSET 0x20
+#define LCD_SETCGRAMADDR 0x40
+#define LCD_SETDDRAMADDR 0x80
+
+// flags for display entry mode
+#define LCD_ENTRYRIGHT 0x00
+#define LCD_ENTRYLEFT 0x02
+#define LCD_ENTRYSHIFTINCREMENT 0x01
+#define LCD_ENTRYSHIFTDECREMENT 0x00
+
+// flags for display on/off control
+#define LCD_DISPLAYON 0x04
+#define LCD_DISPLAYOFF 0x00
+#define LCD_CURSORON 0x02
+#define LCD_CURSOROFF 0x00
+#define LCD_BLINKON 0x01
+#define LCD_BLINKOFF 0x00
+
+// flags for display/cursor shift
+#define LCD_DISPLAYMOVE 0x08
+#define LCD_CURSORMOVE 0x00
+#define LCD_MOVERIGHT 0x04
+#define LCD_MOVELEFT 0x00
+
+// flags for function set
+#define LCD_8BITMODE 0x10
+#define LCD_4BITMODE 0x00
+#define LCD_2LINE 0x08
+#define LCD_1LINE 0x00
+#define LCD_5x10DOTS 0x04
+#define LCD_5x8DOTS 0x00
+
+// flags for backlight control
+#define LCD_BACKLIGHT 0x08
+#define LCD_NOBACKLIGHT 0x00
+
+#define I2C_1062_E 0x04  // Enable bit
+#define I2C_1062_RW 0x02  // Read/Write bit
+#define I2C_1062_RS 0x01  // Register select bit
+
+#define LCD_I2C_CH 		HT_I2C1
+#define LCD_MAX_ROWS	2
+
+
+u8 _backlightval;
+u8 _displaycontrol;
+u8 _displayfunction;
+
+#define I2C_MASTER_ADDRESS     0x60
+//#define I2C_SLAVE_ADDRESS      0x3F   //PCF8574A
+#define I2C_SLAVE_ADDRESS      0x27 //PCF8574
+#define ClockSpeed             200000
+/* Private variables ---------------------------------------------------------------------------------------*/
+TM_TimeBaseInitTypeDef MCTM_TimeBaseInitStructure;
+TM_OutputInitTypeDef MCTM_OutputInitStructure;
+MCTM_CHBRKCTRInitTypeDef MCTM_CHBRKCTRInitStructure;
+
+void Delay_us(int cnt)
+{
+	int i;
+	for(i=0;i<cnt;i++);
+}
+void I2C_Write(HT_I2C_TypeDef* I2Cx, u16 slave_address, u8* buffer, u8 BufferSize){
+	u8 Tx_Index = 0;
+	
+  /* Send I2C START & I2C slave address for write                                                           */
+  I2C_TargetAddressConfig(I2Cx, slave_address, I2C_MASTER_WRITE);
+
+  /* Check on Master Transmitter STA condition and clear it                                                 */
+  while (!I2C_CheckStatus(I2Cx, I2C_MASTER_SEND_START));
+	
+  /* Check on Master Transmitter ADRS condition and clear it                                                */
+  while (!I2C_CheckStatus(I2Cx, I2C_MASTER_TRANSMITTER_MODE));
+	
+  /* Send data                                                                                              */
+  while (Tx_Index < BufferSize)
+  {
+    /* Check on Master Transmitter TXDE condition                                                           */
+    while (!I2C_CheckStatus(I2Cx, I2C_MASTER_TX_EMPTY));
+    /* Master Send I2C data                                                                                 */
+    I2C_SendData(I2Cx, buffer[Tx_Index ++]);
+  }
+  /* Send I2C STOP condition                                                                                */
+  I2C_GenerateSTOP(I2Cx);
+  /*wait for BUSBUSY become idle                                                                            */
+  while (I2C_ReadRegister(I2Cx, I2C_REGISTER_SR)&0x80000);
+}
+void I2C_Read(HT_I2C_TypeDef* I2Cx, u16 slave_address, u8* buffer, u8 BufferSize){
+	u8 Rx_Index = 0;
+	
+	/* Send I2C START & I2C slave address for read                                                            */
+  I2C_TargetAddressConfig(I2Cx, slave_address, I2C_MASTER_READ);
+
+  /* Check on Master Transmitter STA condition and clear it                                                 */
+  while (!I2C_CheckStatus(I2Cx, I2C_MASTER_SEND_START));
+
+  /* Check on Master Transmitter ADRS condition and clear it                                                */
+  while (!I2C_CheckStatus(I2Cx, I2C_MASTER_RECEIVER_MODE));
+
+  I2C_AckCmd(I2Cx, ENABLE);
+  /* Send data                                                                                              */
+  while (Rx_Index < BufferSize)
+  {
+
+    /* Check on Slave Receiver RXDNE condition                                                              */
+    while (!I2C_CheckStatus(I2Cx, I2C_MASTER_RX_NOT_EMPTY));
+    /* Store received data on I2C1                                                                          */
+    buffer[Rx_Index ++] = I2C_ReceiveData(I2Cx);
+    if (Rx_Index == (BufferSize-1))
+    {
+      I2C_AckCmd(I2Cx, DISABLE);
+    }
+  }
+  /* Send I2C STOP condition                                                                                */
+  I2C_GenerateSTOP(I2Cx);
+  /*wait for BUSBUSY become idle                                                                            */
+  while (I2C_ReadRegister(I2Cx, I2C_REGISTER_SR)&0x80000);
+}
+void LCD_I2C_1602_4bit_Write(u8 data){
+	data |= _backlightval;
+	
+	I2C_Write(LCD_I2C_CH,I2C_SLAVE_ADDRESS,&data,1);
+
+	data |= I2C_1062_E;
+	I2C_Write(LCD_I2C_CH,I2C_SLAVE_ADDRESS,&data,1);
+	Delay_us(1000);
+	
+	data &= ~I2C_1062_E;
+	I2C_Write(LCD_I2C_CH,I2C_SLAVE_ADDRESS,&data,1);
+	Delay_us(50000);
+}
+
+void LCD_command(u8 command){
+	u8 high_4b = command & 0xF0;
+	u8 low_4b = (command<<4) & 0xF0;
+	
+	LCD_I2C_1602_4bit_Write(high_4b);
+	LCD_I2C_1602_4bit_Write(low_4b);
+}
+
+void LCD_ini(void){
+	_backlightval=LCD_BACKLIGHT;
+
+	_displayfunction = LCD_4BITMODE | LCD_2LINE | LCD_5x8DOTS;
+	Delay_us(200000);
+
+	LCD_I2C_1602_4bit_Write(0x30);
+	Delay_us(500000);
+	LCD_I2C_1602_4bit_Write(0x30);
+	Delay_us(200000);
+	LCD_I2C_1602_4bit_Write(0x30);
+	Delay_us(200000);
+	//printf("33");
+	LCD_I2C_1602_4bit_Write(LCD_FUNCTIONSET | LCD_4BITMODE);
+	
+	LCD_command(LCD_FUNCTIONSET | _displayfunction); 
+	
+	_displaycontrol = LCD_DISPLAYOFF | LCD_CURSOROFF | LCD_BLINKOFF;
+	LCD_command(LCD_DISPLAYCONTROL | _displaycontrol);
+	
+	LCD_command(LCD_CLEARDISPLAY);
+	Delay_us(200000);
+	
+	LCD_command(LCD_ENTRYMODESET | LCD_ENTRYLEFT | LCD_ENTRYSHIFTDECREMENT);
+	
+	LCD_command(LCD_RETURNHOME);
+	Delay_us(200000);
+	
+	_displaycontrol = LCD_DISPLAYON | LCD_CURSOROFF | LCD_BLINKOFF;
+	LCD_command(LCD_DISPLAYCONTROL | _displaycontrol);
+}
+
+void LCD_Backlight(u8 enable){
+	u8 data = 0;
+	if(enable)	_backlightval=LCD_BACKLIGHT;
+	else				_backlightval=LCD_NOBACKLIGHT;
+	data = _backlightval;
+	I2C_Write(LCD_I2C_CH,I2C_SLAVE_ADDRESS,&data,1);
+}
+
+//????CKCU?AFIO
+void I2C_Configuration(/*HT_I2C_TypeDef* I2Cx*/){
+  /* I2C Master configuration                                                                               */
+  I2C_InitTypeDef  I2C_InitStructure;
+
+  I2C_InitStructure.I2C_GeneralCall = DISABLE;
+  I2C_InitStructure.I2C_AddressingMode = I2C_ADDRESSING_7BIT;//I2C_ADDRESSING_7BIT 
+  I2C_InitStructure.I2C_Acknowledge = DISABLE;
+  I2C_InitStructure.I2C_OwnAddress = I2C_MASTER_ADDRESS;
+  I2C_InitStructure.I2C_Speed = ClockSpeed;
+  I2C_Init(HT_I2C1, &I2C_InitStructure);
+
+	
+	I2C_InitStructure.I2C_Acknowledge = DISABLE;
+  I2C_InitStructure.I2C_OwnAddress = I2C_SLAVE_ADDRESS;
+  //I2C_InitStructure.I2C_Speed = ClockSpeed;
+  I2C_Init(HT_I2C0, &I2C_InitStructure);
+  /* Enable I2C                                                                                             */
+  I2C_Cmd(HT_I2C0 , ENABLE);
+	I2C_Cmd(HT_I2C1 , ENABLE);
+}
+
+/* Global functions ----------------------------------------------------------------------------------------*/
+/*********************************************************************************************************//**
+  * @brief  Main program.
+  * @retval None
+  ***********************************************************************************************************/
+void LCD_setCursor(uint8_t col, uint8_t row){
+	int row_offsets[] = { 0x00, 0x40, 0x14, 0x54 };
+	if (row > LCD_MAX_ROWS) {
+		row = LCD_MAX_ROWS-1;    // we count rows starting w/0
+	}
+	LCD_command(LCD_SETDDRAMADDR | (col + row_offsets[row]));
+}
+
+void LCD_Write(u8 Data){
+	u8 high_4b = (Data & 0xF0) | I2C_1062_RS;
+	u8 low_4b = ((Data<<4) & 0xF0) | I2C_1062_RS;
+	
+	LCD_I2C_1602_4bit_Write(high_4b);
+	LCD_I2C_1602_4bit_Write(low_4b);
+}
+
+void CKCU_Configuration(void)
+{
+  CKCU_PeripClockConfig_TypeDef CKCUClock = {{ 0 }};
+  CKCUClock.Bit.AFIO       = 1;
+  CKCUClock.Bit.MCTM0      = 1;
+	CKCUClock.Bit.PA				 = 1;
+	CKCUClock.Bit.EXTI				 = 1;
+	CKCUClock.Bit.PC			 = 1;
+	CKCUClock.Bit.PB				 = 1;
+	CKCUClock.Bit.PD				 = 1;
+	CKCUClock.Bit.I2C0       = 1;
+	CKCUClock.Bit.I2C1       = 1;
+  CKCUClock.Bit.ADC        = 1;
+	CKCUClock.Bit.BFTM0       = 1;
+  CKCU_PeripClockConfig(CKCUClock, ENABLE);
+}
+
+
+void GPIO_Configuration(void)
+{
+	 AFIO_GPxConfig(GPIO_PC, AFIO_PIN_4 | 
+                          AFIO_PIN_5 , AFIO_FUN_I2C);
+  /* Configure MCTM Channel 0 output pin                                                                    */
+  AFIO_GPxConfig(GPIO_PC, AFIO_PIN_1, AFIO_FUN_MCTM_GPTM);
+	AFIO_GPxConfig(GPIO_PB,AFIO_PIN_12,AFIO_FUN_GPIO);
+  //???Input
+  GPIO_DirectionConfig(HT_GPIOB, GPIO_PIN_12, GPIO_DIR_IN);
+  //???????????
+  GPIO_PullResistorConfig(HT_GPIOB, GPIO_PIN_12, GPIO_PR_DISABLE);
+  //??Input??
+  GPIO_InputConfig(HT_GPIOB, GPIO_PIN_12, ENABLE);
+
+  /* Configure MCTM Break pin                                                                               */
+  AFIO_GPxConfig(GPIO_PB, AFIO_PIN_4, AFIO_FUN_MCTM_GPTM);
+	
+	AFIO_GPxConfig(GPIO_PC, AFIO_PIN_10, AFIO_FUN_GPIO);
+  AFIO_GPxConfig(GPIO_PD, AFIO_PIN_1, AFIO_FUN_GPIO);
+  AFIO_GPxConfig(GPIO_PD, AFIO_PIN_2, AFIO_FUN_GPIO);
+	AFIO_GPxConfig(GPIO_PA, AFIO_PIN_15, AFIO_FUN_GPIO);
+	AFIO_GPxConfig(GPIO_PC, AFIO_PIN_14, AFIO_FUN_GPIO);
+	AFIO_GPxConfig(GPIO_PC, AFIO_PIN_15, AFIO_FUN_GPIO);
+  /* Configure GPIO direction of input pins                                                                 */
+  GPIO_DirectionConfig(HT_GPIOC, GPIO_PIN_10, GPIO_DIR_IN);
+  GPIO_DirectionConfig(HT_GPIOD, GPIO_PIN_1, GPIO_DIR_OUT);
+  GPIO_DirectionConfig(HT_GPIOD, GPIO_PIN_2, GPIO_DIR_OUT);
+	GPIO_DirectionConfig(HT_GPIOA, GPIO_PIN_15, GPIO_DIR_OUT);
+	GPIO_DirectionConfig(HT_GPIOC, GPIO_PIN_14, GPIO_DIR_OUT);
+	GPIO_DirectionConfig(HT_GPIOC, GPIO_PIN_15, GPIO_DIR_OUT);
+  /* Configure GPIO pull resistor of input pins                                                             */
+  //GPIO_PullResistorConfig(HT_GPIOB, GPIO_PIN_12, GPIO_PR_DOWN);
+  GPIO_PullResistorConfig(HT_GPIOC, GPIO_PIN_10, GPIO_PR_DISABLE);
+  GPIO_PullResistorConfig(HT_GPIOD, GPIO_PIN_1, GPIO_PR_DISABLE);
+  GPIO_PullResistorConfig(HT_GPIOD, GPIO_PIN_2, GPIO_PR_DISABLE);
+  GPIO_PullResistorConfig(HT_GPIOA, GPIO_PIN_15, GPIO_PR_DISABLE);
+	GPIO_PullResistorConfig(HT_GPIOC, GPIO_PIN_14, GPIO_PR_DISABLE);
+	GPIO_PullResistorConfig(HT_GPIOC, GPIO_PIN_15, GPIO_PR_DISABLE);
+  GPIO_InputConfig(HT_GPIOC, GPIO_PIN_10, ENABLE);
+  GPIO_InputConfig(HT_GPIOD, GPIO_PIN_1, ENABLE);
+  GPIO_InputConfig(HT_GPIOD, GPIO_PIN_2, ENABLE);
+	GPIO_InputConfig(HT_GPIOA, GPIO_PIN_15, ENABLE);
+	GPIO_InputConfig(HT_GPIOC, GPIO_PIN_14, ENABLE);
+	GPIO_InputConfig(HT_GPIOC, GPIO_PIN_15, ENABLE);
+	
+	GPIO_DirectionConfig(HT_GPIOA, GPIO_PIN_5, GPIO_DIR_IN);
+	GPIO_PullResistorConfig(HT_GPIOA,GPIO_PIN_5,GPIO_PR_UP);
+	GPIO_InputConfig(HT_GPIOA, GPIO_PIN_5,ENABLE);
+	GPIO_DirectionConfig(HT_GPIOA, GPIO_PIN_7, GPIO_DIR_OUT);
+	
+	
+	
+	
+	AFIO_GPxConfig(GPIO_PA, GPIO_PIN_0 | 
+                          GPIO_PIN_1 |
+													GPIO_PIN_2 | 
+                          GPIO_PIN_3 ,AFIO_FUN_GPIO);	
+	AFIO_GPxConfig(GPIO_PB, GPIO_PIN_0 | 
+                          GPIO_PIN_1 |
+													GPIO_PIN_2 | 
+                          GPIO_PIN_3 |
+													
+													GPIO_PIN_5 |
+													GPIO_PIN_6 |
+	                        GPIO_PIN_7|
+	                        GPIO_PIN_8,AFIO_FUN_GPIO);		
+  /* ????I/O??                                                          */
+	GPIO_DirectionConfig(HT_GPIOA, GPIO_PIN_0 | 
+                                 GPIO_PIN_1	|
+																 GPIO_PIN_2 | 
+                                 GPIO_PIN_3,GPIO_DIR_IN);
+	GPIO_DirectionConfig(HT_GPIOB, GPIO_PIN_0 | 
+                                 GPIO_PIN_1	|
+																 GPIO_PIN_2 | 
+                                 GPIO_PIN_3 |
+																
+																 GPIO_PIN_5 |
+															  	GPIO_PIN_6 |
+															  GPIO_PIN_7|
+	                        GPIO_PIN_8,GPIO_DIR_OUT);
+  /* ??????????/????                                                            */
+	GPIO_PullResistorConfig(HT_GPIOA, GPIO_PIN_0 | 
+																		GPIO_PIN_1 |
+																		GPIO_PIN_2 | 
+																		GPIO_PIN_3,GPIO_PR_UP);	
+	GPIO_PullResistorConfig(HT_GPIOB, GPIO_PIN_0 | 
+																		GPIO_PIN_1 |
+																		GPIO_PIN_2 | 
+																		GPIO_PIN_3 |
+																	
+																		GPIO_PIN_5 |
+													GPIO_PIN_6 |
+	                        GPIO_PIN_7|
+	                        GPIO_PIN_8,GPIO_PR_DISABLE);	
+  /* ????????Input??                                                           */
+	GPIO_InputConfig(HT_GPIOA, GPIO_PIN_0 | 
+														 GPIO_PIN_1 |
+														 GPIO_PIN_2 | 
+														 GPIO_PIN_3,ENABLE);	
+	GPIO_InputConfig(HT_GPIOB, GPIO_PIN_0 | 
+														 GPIO_PIN_1 |
+														 GPIO_PIN_2 | 
+														 GPIO_PIN_3 |
+														
+														 GPIO_PIN_5 |
+													GPIO_PIN_6 |
+	                        GPIO_PIN_7|
+	                        GPIO_PIN_8,ENABLE);
+	
+	
+}
+
+void EXTI_configuration(void)
+{
+  EXTI_InitTypeDef EXTI_InitStruct;
+
+  AFIO_EXTISourceConfig(AFIO_EXTI_CH_12, AFIO_ESS_PB);
+  EXTI_InitStruct.EXTI_Channel=EXTI_CHANNEL_12;
+  EXTI_InitStruct.EXTI_Debounce=EXTI_DEBOUNCE_ENABLE;
+  EXTI_InitStruct.EXTI_DebounceCnt=32000;
+  //for 1ms, 1ms*32MHz=32000
+  EXTI_InitStruct.EXTI_IntType=EXTI_POSITIVE_EDGE;
+  EXTI_Init(&EXTI_InitStruct);
+  EXTI_IntConfig(EXTI_CHANNEL_12, ENABLE);
+
+}
+void NVIC_configuration(void){
+  NVIC_EnableIRQ(EXTI12_IRQn);
+
+
+  NVIC_SetPriority(EXTI4_15_IRQn, 1);
+
+}
+void ADC_configuration(void)
+{
+  /* Config AFIO mode as ADC function                                                                       */
+  AFIO_GPxConfig(GPIO_PA, AFIO_PIN_6, AFIO_FUN_ADC);
+
+  /* Continuous Mode, Length 1, SubLength 1                                                                 */
+  ADC_RegularGroupConfig(HT_ADC, CONTINUOUS_MODE, 1, 1);
+
+  /* ADC Channel n, Rank 0, Sampling clock is (1.5 + 0) ADCLK
+  Conversion time = (sampling clock + 12.5) / ADCLK = 12.4 uS */
+  ADC_RegularChannelConfig(HT_ADC, ADC_CH_6, 0);
+
+  /* Use Software Trigger as ADC trigger source                                                             */
+  ADC_RegularTrigConfig(HT_ADC, ADC_TRIG_SOFTWARE);
+
+  ADC_Cmd(HT_ADC, ENABLE);
+
+  /* Software trigger to start continuous mode                                                              */
+  ADC_SoftwareStartConvCmd(HT_ADC, ENABLE);
+}
+void MCTM_Configuration(void)
+{
+ /* MCTM Time Base configuration                                                                            */
+  MCTM_TimeBaseInitStructure.CounterReload = HTCFG_MCTM_RELOAD - 1;
+  MCTM_TimeBaseInitStructure.Prescaler = 2000;
+  MCTM_TimeBaseInitStructure.RepetitionCounter = 0;
+  MCTM_TimeBaseInitStructure.CounterMode = TM_CNT_MODE_UP;
+  MCTM_TimeBaseInitStructure.PSCReloadTime = TM_PSC_RLD_IMMEDIATE;
+  TM_TimeBaseInit(HT_MCTM0, &MCTM_TimeBaseInitStructure);
+
+  /* MCTM Channel 0 output configuration                                                                    */
+  MCTM_OutputInitStructure.Channel = TM_CH_0;
+  MCTM_OutputInitStructure.OutputMode = TM_OM_PWM1;
+  MCTM_OutputInitStructure.Control = TM_CHCTL_ENABLE;
+  MCTM_OutputInitStructure.ControlN = TM_CHCTL_ENABLE;
+  MCTM_OutputInitStructure.Polarity = TM_CHP_NONINVERTED;
+  MCTM_OutputInitStructure.PolarityN = TM_CHP_NONINVERTED;
+  MCTM_OutputInitStructure.IdleState = MCTM_OIS_LOW;
+  MCTM_OutputInitStructure.IdleStateN = MCTM_OIS_HIGH;
+	
+  MCTM_OutputInitStructure.Channel = TM_CH_0;
+  MCTM_OutputInitStructure.Compare = HTCFG_MCTM_RELOAD * 1/2;
+  TM_OutputInit(HT_MCTM0, &MCTM_OutputInitStructure);
+
+  /* MCTM Off State, lock, Break, Automatic Output enable, dead time configuration                          */
+  MCTM_CHBRKCTRInitStructure.OSSRState = MCTM_OSSR_STATE_ENABLE;
+  MCTM_CHBRKCTRInitStructure.OSSIState = MCTM_OSSI_STATE_ENABLE;
+  MCTM_CHBRKCTRInitStructure.LockLevel = MCTM_LOCK_LEVEL_2;
+  MCTM_CHBRKCTRInitStructure.Break0 = MCTM_BREAK_ENABLE;
+  MCTM_CHBRKCTRInitStructure.Break0Polarity = MCTM_BREAK_POLARITY_LOW;
+  MCTM_CHBRKCTRInitStructure.AutomaticOutput = MCTM_CHAOE_ENABLE;
+  MCTM_CHBRKCTRInitStructure.DeadTime = HTCFG_MCTM_DEAD_TIME;
+  MCTM_CHBRKCTRInitStructure.BreakFilter = 0;
+  MCTM_CHBRKCTRConfig(HT_MCTM0, &MCTM_CHBRKCTRInitStructure);
+
+  /* MCTM counter enable                                                                                    */
+  TM_Cmd(HT_MCTM0, ENABLE);
+
+  /* MCTM Channel Main Output enable                                                                        */
+  MCTM_CHMOECmd(HT_MCTM0, ENABLE);
+}
+vu32 BFTM_OverCnt;
+void BFTM_Configuration(void){
+  //??????????89s,???????
+
+  //??????10s
+  int Compare = SystemCoreClock * 10;
+  //??????
+  BFTM_SetCompare(HT_BFTM0,Compare-1);
+  //???????
+  BFTM_OneShotModeCmd(HT_BFTM0, DISABLE);
+  //BFTM??
+  BFTM_EnaCmd(HT_BFTM0, ENABLE);
+}
+
+void BFTM_ReStart(void){
+  BFTM_OverCnt = 0;
+  BFTM_SetCounter(HT_BFTM0, 0);
+  BFTM_EnaCmd(HT_BFTM0, ENABLE);
+}
+void BFTM_end(void){//?????89s???
+  BFTM_EnaCmd(HT_BFTM0, DISABLE);
+}
+float BFTM_us(void){
+  // Reload=SYSTICK          => 1s
+  // Reload=SYSTICK/1000     => 1ms
+  // Reload=SYSTICK/1000000  => 1us
+  float count = BFTM_GetCounter(HT_BFTM0);
+  return count/(SystemCoreClock/1000000) + BFTM_OverCnt*1000000*10;;
+}
+void delay(int cnt)
+{
+	int i;
+	for(i=0;i<cnt;i++);
+}
+/* Global functions ----------------------------------------------------------------------------------------*/
+/*********************************************************************************************************//**
+  * @brief  Main program.
+  * @retval None
+  ***********************************************************************************************************/
+
+void lcd_print(u8 q,u8 w,char pt[]){
+	int i;
+	int len;
+	  CKCU_Configuration();               /* System Related configuration                                       */
+  GPIO_Configuration();               /* GPIO Related configuration                                         */
+		I2C_Configuration();
+	RETARGET_Configuration();
+	
+	len=strlen(pt);
+	LCD_setCursor(q,w);
+	for(i=0;i<len;i++){
+		LCD_Write(pt[i]);
+	}
+	
+	
+}
+void lcd_int_print(int num){
+	int len;
+	int cnum,ten;
+	int i,j;
+	CKCU_Configuration();               /* System Related configuration                                       */
+  GPIO_Configuration();               /* GPIO Related configuration                                         */
+		I2C_Configuration();
+	RETARGET_Configuration();
+	cnum=num;
+	for(len=0;cnum<1;len++)cnum=cnum/10;
+	for(i=0;i<len;i++){
+		cnum=num;
+		ten=1;
+		for(j=0;j<len-i-1;j++)ten=ten*10;
+		cnum=cnum%ten;
+		LCD_Write(cnum);
+		num=num-cnum*ten;
+	}
+}
+
+
+
+int a,ra,time,rtime,eat_time;
+
+int main(void)
+{
+	int cm;
+	float Distance;
+	bool flag;
+  int i,j,day,hour,min,sec,fin;
+	int check;
+	bool f;
+	fin =0;
+	f=0;
+  CKCU_Configuration();               /* System Related configuration                                       */
+  GPIO_Configuration();               /* GPIO Related configuration                                         */
+		ADC_configuration();
+  MCTM_Configuration();
+	EXTI_configuration();//??EXTI??
+  NVIC_configuration();//??NVIC??
+	 	I2C_Configuration();
+	RETARGET_Configuration();
+	Distance =0;
+	cm=15;
+	rtime=0;
+	a=1;
+	ra=1;	
+	time=0;   //time=0
+	flag=1;
+	LCD_ini();
+  while (1){
+		lcd_print(0,0,"function:A'B'C'D");
+		lcd_print(0,1,"on:");
+		
+		if(a==time){
+			LCD_Write(' ');
+			LCD_Write('a');		
+		}
+		if(ra==rtime){
+			LCD_Write(' ');
+			LCD_Write('r');
+			LCD_Write('a');
+		}
+		if(f==1){
+			LCD_Write(' ');
+			LCD_Write('f');
+		}
+		GPIO_WriteOutBits(HT_GPIOB,GPIO_PIN_0, 1);
+		GPIO_WriteOutBits(HT_GPIOB,GPIO_PIN_1, 1);
+		GPIO_WriteOutBits(HT_GPIOB,GPIO_PIN_2, 1);
+		GPIO_WriteOutBits(HT_GPIOB,GPIO_PIN_3, 1);
+   if(GPIO_ReadInBit(HT_GPIOC, GPIO_PIN_10)==1&&flag==1){
+		 if(a==time||ra==rtime){
+			 		LCD_ini();
+			 if(a==time)lcd_print(0,0,"Aeat");
+			if(ra==rtime)lcd_print(0,0,"Beat");
+			 GPIO_WriteOutBits(HT_GPIOA,GPIO_PIN_15, 1);
+	     for(i=0;i<10000000;i++);
+			 GPIO_WriteOutBits(HT_GPIOA,GPIO_PIN_15, 0);
+			 LCD_ini();
+		 }
+		 a=a+1;
+		 ra=ra+1;		 
+   flag=0;		 
+	 }
+		if((GPIO_ReadInBit(HT_GPIOC, GPIO_PIN_10)==0&&flag==0)){
+			flag=1;
+		}
+		
+		if(f==1){
+				
+		//??Trigger
+		GPIO_WriteOutBits(HT_GPIOA, GPIO_PIN_5, SET);
+		BFTM_ReStart();
+		while(BFTM_us()<10);
+		GPIO_WriteOutBits(HT_GPIOA, GPIO_PIN_5, RESET);
+		
+		//??Echo??
+		while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_7) == RESET);
+		BFTM_ReStart();
+		
+		//??Echo??
+		while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_7) == SET);
+		BFTM_end();
+		
+		//????
+		Distance = BFTM_us();
+    	if(Distance < cm){
+			LCD_ini();
+				lcd_print(0,0,"Deat");
+				GPIO_WriteOutBits(HT_GPIOA,GPIO_PIN_15, 1);
+	     for(i=0;i<10000000;i++);
+			 GPIO_WriteOutBits(HT_GPIOA,GPIO_PIN_15, 0);
+				f=0;
+		}
+	}
+		
+
+		
+		GPIO_WriteOutBits(HT_GPIOB,GPIO_PIN_3, 0);
+		if(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_0)==0){             //A
+			GPIO_WriteOutBits(HT_GPIOB,GPIO_PIN_3, 1);
+			a=0;
+			LCD_ini();
+			lcd_print(0,0,"day");
+			LCD_setCursor(0,1);
+						LCD_Write('_');
+					LCD_Write('_');
+			day=checkword();
+			LCD_ini();
+			lcd_print(0,0,"hour");
+			LCD_setCursor(0,1);
+						LCD_Write('_');
+					LCD_Write('_');
+			hour=checkword();
+			LCD_ini();
+			lcd_print(0,0,"min");
+			LCD_setCursor(0,1);
+						LCD_Write('_');
+					LCD_Write('_');
+			min=checkword();
+			LCD_ini();
+			lcd_print(0,0,"sec");
+			LCD_setCursor(0,1);
+						LCD_Write('_');
+					LCD_Write('_');
+			sec=checkword();
+			LCD_ini();
+			min=min*60;
+			hour=hour*3600;
+			day=day*43200;
+			time=sec+min+hour+day;
+		}
+		if(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_1)==0){              //B
+			GPIO_WriteOutBits(HT_GPIOB,GPIO_PIN_3, 1);
+			ra=0;
+			LCD_ini();
+			lcd_print(0,0,"day");
+			LCD_setCursor(0,1);
+			LCD_Write('_');
+			LCD_Write('_');
+			day=checkword();
+			LCD_ini();
+			lcd_print(0,0,"hour");
+			LCD_setCursor(0,1);
+			LCD_Write('_');
+			LCD_Write('_');
+			hour=checkword();
+			LCD_ini();
+			lcd_print(0,0,"min");
+			LCD_setCursor(0,1);
+			LCD_Write('_');
+			LCD_Write('_');
+			min=checkword();
+			LCD_ini();
+			lcd_print(0,0,"sec");
+			LCD_setCursor(0,1);
+			LCD_Write('_');
+			LCD_Write('_');
+			sec=checkword();
+			LCD_ini();
+			min=min*60;
+			hour=hour*3600;
+			day=day*43200;
+			rtime=sec+min+hour+day;
+		}
+		
+		
+		if(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_2)==0){              //C
+			GPIO_WriteOutBits(HT_GPIOB,GPIO_PIN_3, 1);
+				LCD_ini();
+				lcd_print(0,0,"Ceat");
+			GPIO_WriteOutBits(HT_GPIOA,GPIO_PIN_15, 1);
+	     for(i=0;i<10000000;i++);
+			 GPIO_WriteOutBits(HT_GPIOA,GPIO_PIN_15, 0);
+			
+		}
+		
+		
+		if(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_3)==0){              //D
+			while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_3)==0);
+			lcd_print(0,0,"clr:A'B check:C");
+			lcd_print(0,1,"setting:D");
+			while(1){
+					if(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_0)==0){
+						time=0;
+						break;
+					}
+					if(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_1)==0){
+						rtime=0;
+						break;
+					}
+					if(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_2)==0){
+						while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_2)==0);
+						LCD_ini();
+						lcd_print(0,0,"a=");
+						lcd_int_print(a);
+						LCD_Write('t');
+						LCD_Write('=');
+						lcd_int_print(time);
+						lcd_print(0,1,"press:A");
+						while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_0)==1);
+						LCD_ini();
+						lcd_print(0,0,"ra=");
+						lcd_int_print(ra);
+						LCD_Write('r');
+						LCD_Write('t');
+						LCD_Write('=');
+						lcd_int_print(rtime);
+						lcd_print(0,1,"press:A");
+						while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_0)==1);
+						LCD_ini();
+						lcd_print(0,0,"dis=");
+						lcd_int_print(cm);
+						LCD_Write('f');
+						LCD_Write('=');
+						if(f==1){
+							LCD_Write('o');
+							LCD_Write('n');
+						}
+						else {
+							LCD_Write('o');
+							LCD_Write('f');
+							LCD_Write('f');
+						}
+						lcd_print(0,1,"press:A");
+						while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_0)==1);
+						LCD_ini();
+						lcd_print(0,0,"eat time=");
+						lcd_int_print(eat_time);
+						lcd_print(0,1,"press:A");
+						while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_0)==1);
+						break;
+					}
+					if(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_3)==0){
+						while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_3)==0);
+						LCD_ini();
+				   	lcd_print(0,0,"A:initial B:dis");
+						lcd_print(0,1,"C:eat_time D:f");
+						while(1){
+							if(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_0)==0){
+							while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_0)==0);
+								LCD_ini();
+								lcd_print(0,0,"initialization?");
+							  lcd_print(0,0,"yes:11 no:00?");
+								checkword();
+								if(11==checkword()){
+									cm=15;
+									eat_time=1;
+									f=0;
+									time=0;
+									rtime=0;
+								}
+							}	
+						
+							if(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_1)==0){
+								while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_1)==0);
+								LCD_ini();
+								lcd_print(0,0,"distance=?");
+								cm=checkword();
+							}	
+						
+							if(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_2)==0){
+								while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_2)==0);
+								LCD_ini();
+								lcd_print(0,0,"eat sec=?");
+								eat_time=checkword();
+							}	
+						
+							if(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_3)==0){
+								while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_3)==0);
+//							if(f==1){
+//							lcd_print(0,0,"f=1");
+//							}
+//							else lcd_print(0,0,"f=0");
+//							fin=checkword();
+//							if(fin>0) f=1;
+//							else f=0;
+								if(f==1)f=0;
+							  else f=1;
+							}	
+						}	
+						break;
+					}
+				}
+					while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_0)==0);
+					while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_1)==0);
+				  while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_2)==0);
+			GPIO_WriteOutBits(HT_GPIOB,GPIO_PIN_3, 1);
+		}
+		
+		
+		
+		
+  }
+	return 0;
+}
+
+int checkword(void){
+	int i,j,sum,x,y;
+	int number[3][3]={
+		{1, 2, 3 },
+		{4, 5, 6 },
+		{7, 8, 9 }};
+	uint16_t  A[4]={GPIO_PIN_0,GPIO_PIN_1,GPIO_PIN_2,GPIO_PIN_3};
+	uint16_t	B[4]={GPIO_PIN_0,GPIO_PIN_1,GPIO_PIN_2,GPIO_PIN_3};
+	sum=0;
+	x=0;
+	while(1){
+		GPIO_WriteOutBits(HT_GPIOB,GPIO_PIN_0, 1);
+		GPIO_WriteOutBits(HT_GPIOB,GPIO_PIN_1, 1);
+		GPIO_WriteOutBits(HT_GPIOB,GPIO_PIN_2, 1);
+		GPIO_WriteOutBits(HT_GPIOB,GPIO_PIN_3, 1);
+		for(i=0;i<3;i++){                                               //1-9
+			GPIO_WriteOutBits(HT_GPIOB,B[i], 0);
+			for(j=0;j<3;j++){
+				if(GPIO_ReadInBit(HT_GPIOA, A[j])==0){
+					if(x==0){
+						LCD_setCursor(0,1);
+						LCD_Write('0'+number[j][i]);
+						sum=(sum+(number[j][i]*10));
+						while(GPIO_ReadInBit(HT_GPIOA, A[j])==0);
+						x++;
+					}
+					else if(x==1){
+						LCD_setCursor(1,1);
+						LCD_Write('0'+number[j][i]);
+						sum=sum+number[j][i];
+						while(GPIO_ReadInBit(HT_GPIOA, A[j])==0);		
+						x++;						
+					}
+				}
+				
+			}
+			GPIO_WriteOutBits(HT_GPIOB,B[i], 1);
+		}
+		for(i=0;i<3;i++){                                                //0,*,#
+		GPIO_WriteOutBits(HT_GPIOB,B[i], 0);
+			if(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_3)==0){
+				if(i==0){
+					sum=0;
+					x=0;
+					LCD_setCursor(0,1);
+						LCD_Write('_');
+					LCD_Write('_');
+					GPIO_WriteOutBits(HT_GPIOB,B[i], 1);
+					break;
+				}
+				if(i==1){
+					if(x==0){
+						LCD_setCursor(0,1);
+						LCD_Write('0');
+						while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_3)==0);
+						x++;
+					}
+					else if(x==1){
+						LCD_setCursor(1,1);
+						LCD_Write('0');
+						while(GPIO_ReadInBit(HT_GPIOA, GPIO_PIN_3)==0);		
+							x++;
+					}
+				}
+				if(i==2){
+					return sum;
+				}
+			}			
+			GPIO_WriteOutBits(HT_GPIOB,B[i], 1);
+		}
+		
+	}	
+	return 0;
+}
