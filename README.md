@@ -95,3 +95,7 @@
 | 觸發 (Trig)         | `A5`     | 發送超音波信號。                           |
 | 回波 (Echo)         | `A7`     | 接收超音波信號。                           |
 
+## Demo 影片
+
+點擊下面的連結觀看 demo 影片：
+[觀看自動餵食器 Demo 影片](https://www.youtube.com/watch?v=mAKTvYpgOCs)
